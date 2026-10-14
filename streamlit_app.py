@@ -237,3 +237,180 @@ with st.expander("지표 정의"):
 - **제외 데이터** : 테스트 계정(`QA`로 시작하는 customer_id), 7일을 채우지 못한 마지막 주의 세션
 """
     )
+
+# ─────────────────────────────────────────────
+# 집단 비교
+# ─────────────────────────────────────────────
+st.divider()
+st.subheader("집단 비교")
+
+GROUP_COLS = {"플랫폼": "platform", "유입경로": "traffic_source"}
+CMP_STAGES = {
+    "app_open": "세션수",
+    "view_restaurant": "조회세션",
+    "add_to_cart": "장바구니세션",
+    "begin_checkout": "결제시작세션",
+    "order_complete": "주문세션",
+}
+MIN_GROUP_SESSIONS = 500
+
+cmp_label = st.radio("비교 기준", list(GROUP_COLS), horizontal=True)
+cmp_col = GROUP_COLS[cmp_label]
+
+# 집단별 퍼널 5단계 세션 수 (long 형태: 집단 × 단계)
+cmp_wide = f.groupby(cmp_col)[list(CMP_STAGES)].sum()
+cmp_long = (
+    cmp_wide.rename(columns=CMP_STAGES)
+    .reset_index()
+    .melt(id_vars=cmp_col, var_name="단계", value_name="세션")
+)
+stage_order = list(CMP_STAGES.values())
+cmp_long["단계"] = pd.Categorical(cmp_long["단계"], categories=stage_order, ordered=True)
+cmp_long = cmp_long.sort_values([cmp_col, "단계"]).reset_index(drop=True)
+
+# 누적 전환율(첫 단계 대비 %) / 단계 전환율(직전 단계 대비 %)
+first_stage = cmp_long.groupby(cmp_col)["세션"].transform("first")
+cmp_long["기준세션"] = cmp_long.groupby(cmp_col)["세션"].shift(1)
+cmp_long["누적전환율"] = cmp_long["세션"] / first_stage * 100
+cmp_long["단계전환율"] = cmp_long["세션"] / cmp_long["기준세션"] * 100
+
+cmp_left, cmp_right = st.columns(2)
+
+with cmp_left:
+    st.markdown("**누적 전환율 (첫 단계 대비 %)**")
+    fig_cmp_funnel = px.funnel(
+        cmp_long,
+        x="누적전환율",
+        y="단계",
+        color=cmp_col,
+        text=cmp_long["누적전환율"].map("{:.1f}%".format),
+        category_orders={"단계": stage_order},
+        labels={cmp_col: cmp_label},
+        hover_data={"세션": ":,", "누적전환율": ":.1f"},
+    )
+    fig_cmp_funnel.update_traces(textinfo="text", textposition="inside")
+    # px가 y축 카테고리를 뒤집어 저장하므로, 위→아래 '세션수 → 주문세션' 순서로 다시 지정
+    fig_cmp_funnel.update_yaxes(categoryorder="array", categoryarray=stage_order)
+    fig_cmp_funnel.update_layout(funnelmode="group", margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig_cmp_funnel, width="stretch")
+
+with cmp_right:
+    st.markdown("**단계 전환율 (직전 단계 대비 %)**")
+    step_df = cmp_long.dropna(subset=["기준세션"]).copy()
+    step_df["기준세션"] = step_df["기준세션"].astype(int)
+    fig_cmp_step = px.bar(
+        step_df,
+        x="단계",
+        y="단계전환율",
+        color=cmp_col,
+        barmode="group",
+        text=step_df["단계전환율"].map("{:.1f}".format),
+        category_orders={"단계": stage_order[1:]},
+        labels={cmp_col: cmp_label, "단계전환율": "단계 전환율 (%)"},
+        hover_data={"기준세션": ":,", "세션": ":,", "단계전환율": ":.1f"},
+    )
+    fig_cmp_step.update_traces(textposition="outside", cliponaxis=False)
+    fig_cmp_step.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig_cmp_step, width="stretch")
+
+# 세션 수가 적은 집단 안내
+small_groups = cmp_wide.loc[cmp_wide["app_open"] < MIN_GROUP_SESSIONS, "app_open"]
+if not small_groups.empty:
+    detail = ", ".join(f"{name}({int(n):,}세션)" for name, n in small_groups.items())
+    st.caption(
+        f"⚠️ 세션 수가 {MIN_GROUP_SESSIONS:,}개 미만인 집단이 있습니다: {detail}. "
+        "이 집단의 전환율은 값이 크게 흔들릴 수 있으니 해석에 주의하세요."
+    )
+
+# ─────────────────────────────────────────────
+# 드릴다운: 언제부터, 무엇 때문일까
+# ─────────────────────────────────────────────
+st.divider()
+st.subheader("드릴다운: 언제부터, 무엇 때문일까")
+
+DRILL_STEPS = {
+    "방문 → 식당조회": ("app_open", "view_restaurant"),
+    "식당조회 → 장바구니": ("view_restaurant", "add_to_cart"),
+    "장바구니 → 결제시작": ("add_to_cart", "begin_checkout"),
+    "결제시작 → 주문": ("begin_checkout", "order_complete"),
+}
+
+# 비교 기준이 아닌 다른 축 (플랫폼 ↔ 유입경로)
+other_label = next(label for label in GROUP_COLS if label != cmp_label)
+other_col = GROUP_COLS[other_label]
+
+sel_left, sel_right = st.columns(2)
+with sel_left:
+    drill_group = st.selectbox(
+        f"자세히 볼 집단 ({cmp_label})", sorted(f[cmp_col].unique())
+    )
+with sel_right:
+    drill_step = st.selectbox("단계", list(DRILL_STEPS))
+prev_stage, cur_stage = DRILL_STEPS[drill_step]
+
+drill_weeks = sorted(f["week"].unique())  # f의 기간 = 두 차트의 공통 기간
+
+# ── 차트 ① : 고른 집단의 주별 단계 전환율, 다른 축별로 쪼개 보기
+st.markdown(f"**① {drill_group}의 주별 {drill_step} 전환율 — {other_label}별로 쪼개 보기**")
+
+g = f[f[cmp_col] == drill_group]
+drill_rate = g.groupby(["week", other_col])[[prev_stage, cur_stage]].sum()
+# 데이터가 없는 (주, 갈래) 조합도 빈 값으로 남겨서 선이 이어지지 않게 함
+full_idx = pd.MultiIndex.from_product(
+    [drill_weeks, sorted(g[other_col].unique())], names=["week", other_col]
+)
+drill_rate = drill_rate.reindex(full_idx).reset_index()
+drill_rate = drill_rate.rename(columns={prev_stage: "기준세션", cur_stage: "전환세션"})
+# 직전 단계 세션이 0인 주는 0%로 채우지 않고 빈 값(NaN)으로 둠
+drill_rate["전환율"] = (
+    drill_rate["전환세션"] / drill_rate["기준세션"].where(drill_rate["기준세션"] > 0) * 100
+)
+
+fig_drill_rate = px.line(
+    drill_rate,
+    x="week",
+    y="전환율",
+    color=other_col,
+    markers=True,
+    labels={"week": "주 (월요일 시작)", "전환율": f"{drill_step} 전환율 (%)", other_col: other_label},
+    hover_data={"기준세션": ":,", "전환세션": ":,", "전환율": ":.1f"},
+)
+fig_drill_rate.update_traces(connectgaps=False)
+fig_drill_rate.update_layout(hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
+st.plotly_chart(fig_drill_rate, width="stretch")
+st.caption("모든 갈래가 같은 시점에 함께 움직였다면, 그 축은 원인이 아닙니다.")
+
+# ── 차트 ② : 같은 기간 결제실패 건수, 고른 집단 vs 그 외
+st.markdown(f"**② 주별 결제실패 건수 — {drill_group} vs 그 외**")
+
+# 결제실패는 세션 테이블에 없는 이벤트이므로, f에 남은 세션의 이벤트만 골라 건수를 셈
+fail_events = events.loc[
+    (events["event_name"] == "payment_fail") & events["session_id"].isin(f["session_id"]),
+    ["session_id"],
+]
+fail = fail_events.merge(f[["session_id", "week", cmp_col]], on="session_id", how="left")
+fail["집단"] = fail[cmp_col].where(fail[cmp_col] == drill_group, "그 외")
+
+group_names = [drill_group, "그 외"]
+fail_weekly = (
+    fail.groupby(["week", "집단"])
+    .size()
+    .reindex(pd.MultiIndex.from_product([drill_weeks, group_names], names=["week", "집단"]), fill_value=0)
+    .rename("결제실패")
+    .reset_index()
+)
+
+fig_drill_fail = px.bar(
+    fail_weekly,
+    x="week",
+    y="결제실패",
+    color="집단",
+    barmode="group",
+    category_orders={"집단": group_names},
+    color_discrete_map={drill_group: "#B71C1C", "그 외": "#9E9E9E"},
+    labels={"week": "주 (월요일 시작)", "결제실패": "결제실패 건수"},
+    hover_data={"결제실패": ":,"},
+)
+fig_drill_fail.update_layout(hovermode="x unified", margin=dict(l=10, r=10, t=10, b=10))
+st.plotly_chart(fig_drill_fail, width="stretch")
+st.caption("문제가 생긴 시점과 함께 움직였다면 원인 후보입니다. 함께 움직였다고 원인이 확정되지는 않습니다.")
